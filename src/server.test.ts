@@ -170,6 +170,8 @@ describe('OpenAI Responses compatibility proxy', () => {
       error: null,
     })
     expect(typeof logEntry.ts).toBe('string')
+    expect(logEntry.ts).toMatch(/[+-]\d{2}:\d{2}$/)
+    expect(logEntry.ts).not.toMatch(/Z$/)
     expect(typeof logEntry.duration_ms).toBe('number')
     expect(JSON.stringify(logEntry)).not.toContain('Say hello')
   })

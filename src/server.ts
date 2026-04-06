@@ -116,6 +116,24 @@ async function parseJsonSafe(response: Response): Promise<unknown> {
   }
 }
 
+function formatLocalTimestamp(date: Date): string {
+  const pad = (value: number, size = 2): string =>
+    value.toString().padStart(size, '0')
+
+  const offsetMinutes = -date.getTimezoneOffset()
+  const sign = offsetMinutes >= 0 ? '+' : '-'
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes)
+  const offsetHours = Math.floor(absoluteOffsetMinutes / 60)
+  const offsetRemainderMinutes = absoluteOffsetMinutes % 60
+
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` +
+    `.${pad(date.getMilliseconds(), 3)}` +
+    `${sign}${pad(offsetHours)}:${pad(offsetRemainderMinutes)}`
+  )
+}
+
 function logRequest(
   config: ProxyConfig,
   entry: {
@@ -133,7 +151,7 @@ function logRequest(
 
   config.logger(
     `[openai-responses-proxy] request ${JSON.stringify({
-      ts: new Date().toISOString(),
+      ts: formatLocalTimestamp(new Date()),
       method: entry.method,
       path: entry.path,
       model: entry.model,
