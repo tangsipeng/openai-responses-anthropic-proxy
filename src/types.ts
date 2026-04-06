@@ -261,6 +261,7 @@ export type ProxyConfig = {
   upstreamURL: string
   upstreamKey: string
   upstreamModel?: string
+  stateFilePath?: string
   upstreamHeaders?: Record<string, string>
   logger?: (line: string) => void
 }

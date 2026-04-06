@@ -38,6 +38,8 @@ export function parseProxyConfigFromArgs(
   let upstreamURL = env.OPENAI_RESPONSES_UPSTREAM_URL ?? ''
   let upstreamKey = env.OPENAI_RESPONSES_UPSTREAM_KEY ?? ''
   let upstreamModel = env.OPENAI_RESPONSES_UPSTREAM_MODEL
+  let stateFilePath =
+    env.OPENAI_RESPONSES_STATE_FILE ?? '.openai-responses-anthropic-proxy-state.json'
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]
@@ -67,6 +69,11 @@ export function parseProxyConfigFromArgs(
       case '--upstream-model':
         if (!next) throw new Error('Missing value for --upstream-model')
         upstreamModel = next
+        index += 1
+        break
+      case '--state-file':
+        if (!next) throw new Error('Missing value for --state-file')
+        stateFilePath = next
         index += 1
         break
       case '--upstream-header':
@@ -99,6 +106,7 @@ export function parseProxyConfigFromArgs(
     upstreamURL,
     upstreamKey,
     ...(upstreamModel ? { upstreamModel } : {}),
+    ...(stateFilePath ? { stateFilePath } : {}),
     ...(Object.keys(upstreamHeaders).length > 0 ? { upstreamHeaders } : {}),
   }
 }

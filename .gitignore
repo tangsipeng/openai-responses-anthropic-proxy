@@ -2,4 +2,6 @@ node_modules
 .env
 dist
 *.log
+.proxy.pid
 .DS_Store
+.openai-responses-anthropic-proxy-state.json

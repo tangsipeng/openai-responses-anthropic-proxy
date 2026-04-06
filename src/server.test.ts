@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import Anthropic from '@anthropic-ai/sdk'
 import { startOpenAIResponsesCompatProxy } from './server.js'
@@ -91,6 +94,7 @@ function parseRequestLog(logLines: string[]): Record<string, unknown> {
 describe('OpenAI Responses compatibility proxy', () => {
   let proxy: RunningOpenAIResponsesCompatProxy | null = null
   const mockServers: MockServer[] = []
+  const tempDirs: string[] = []
 
   beforeEach(() => {
     proxy = null
@@ -101,6 +105,9 @@ describe('OpenAI Responses compatibility proxy', () => {
     proxy = null
     for (const server of mockServers.splice(0)) {
       server.stop()
+    }
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 
@@ -449,6 +456,610 @@ describe('OpenAI Responses compatibility proxy', () => {
     })
   })
 
+  test('restores previous_response_id after the proxy restarts when a state file is configured', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'openai-responses-proxy-'))
+    tempDirs.push(stateDir)
+    const stateFilePath = join(stateDir, 'proxy-state.json')
+
+    const upstream = startMockUpstream(async (_request, requests) => {
+      if (requests.length === 1) {
+        return Response.json({
+          id: 'resp_restart_1',
+          status: 'completed',
+          model: 'gpt-4.1',
+          output: [
+            {
+              type: 'function_call',
+              call_id: 'call_calc_restart_1',
+              name: 'calculator',
+              arguments: '{"expression":"3+4"}',
+            },
+          ],
+          usage: {
+            input_tokens: 8,
+            output_tokens: 2,
+          },
+        })
+      }
+
+      const secondBody = requests[1]?.body as Record<string, unknown> | undefined
+      if (secondBody?.previous_response_id !== 'resp_restart_1') {
+        return Response.json(
+          {
+            error: {
+              message:
+                'No tool call found for function call output with call_id call_calc_restart_1.',
+            },
+          },
+          { status: 400 },
+        )
+      }
+
+      return Response.json({
+        id: 'resp_restart_2',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'The answer is 7.' }],
+          },
+        ],
+        usage: {
+          input_tokens: 4,
+          output_tokens: 5,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+      stateFilePath,
+    })
+
+    const firstClient = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const first = await firstClient.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Use the calculator for 3+4' }],
+      tools: [
+        {
+          name: 'calculator',
+          description: 'Evaluate a math expression',
+          input_schema: {
+            type: 'object',
+            properties: {
+              expression: { type: 'string' },
+            },
+            required: ['expression'],
+          },
+        },
+      ],
+    })
+
+    expect(first.content[0]).toEqual({
+      type: 'tool_use',
+      id: 'call_calc_restart_1',
+      name: 'calculator',
+      input: { expression: '3+4' },
+    })
+
+    proxy.stop()
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+      stateFilePath,
+    })
+
+    const secondClient = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const second = await secondClient.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [
+        { role: 'user', content: 'Use the calculator for 3+4' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'call_calc_restart_1',
+              name: 'calculator',
+              input: { expression: '3+4' },
+            },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_calc_restart_1',
+              content: '7',
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: 'calculator',
+          description: 'Evaluate a math expression',
+          input_schema: {
+            type: 'object',
+            properties: {
+              expression: { type: 'string' },
+            },
+            required: ['expression'],
+          },
+        },
+      ],
+    })
+
+    expect(second.content).toEqual([
+      {
+        type: 'text',
+        text: 'The answer is 7.',
+        citations: null,
+      },
+    ])
+
+    expect(upstream.requests).toHaveLength(2)
+    expect(upstream.requests[1]?.body).toMatchObject({
+      previous_response_id: 'resp_restart_1',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_calc_restart_1',
+          output: '7',
+        },
+      ],
+    })
+  })
+
+  test('uses previous_response_id when Claude splits a multi-tool assistant turn into consecutive assistant messages', async () => {
+    const upstream = startMockUpstream(async (_request, requests) => {
+      if (requests.length === 1) {
+        return Response.json({
+          id: 'resp_multi_1',
+          status: 'completed',
+          model: 'gpt-4.1',
+          output: [
+            {
+              type: 'function_call',
+              call_id: 'call_task_1',
+              name: 'TaskCreate',
+              arguments:
+                '{"subject":"Inspect repository structure","activeForm":"Inspecting repository structure"}',
+            },
+            {
+              type: 'function_call',
+              call_id: 'call_glob_1',
+              name: 'Glob',
+              arguments: '{"path":".","pattern":"src/**/*"}',
+            },
+          ],
+          usage: {
+            input_tokens: 10,
+            output_tokens: 4,
+          },
+        })
+      }
+
+      const secondBody = requests[1]?.body as Record<string, unknown> | undefined
+      if (secondBody?.previous_response_id !== 'resp_multi_1') {
+        return Response.json(
+          {
+            error: {
+              message:
+                'No tool call found for function call output with call_id call_task_1.',
+            },
+          },
+          { status: 400 },
+        )
+      }
+
+      return Response.json({
+        id: 'resp_multi_2',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Repository inspection started.' }],
+          },
+        ],
+        usage: {
+          input_tokens: 5,
+          output_tokens: 4,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const first = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Analyze this project structure' }],
+      tools: [
+        {
+          name: 'TaskCreate',
+          description: 'Create a task',
+          input_schema: {
+            type: 'object',
+            properties: {
+              subject: { type: 'string' },
+              activeForm: { type: 'string' },
+            },
+            required: ['subject'],
+          },
+        },
+        {
+          name: 'Glob',
+          description: 'Find files',
+          input_schema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              pattern: { type: 'string' },
+            },
+            required: ['path', 'pattern'],
+          },
+        },
+      ],
+    })
+
+    expect(first.content).toEqual([
+      {
+        type: 'tool_use',
+        id: 'call_task_1',
+        name: 'TaskCreate',
+        input: {
+          subject: 'Inspect repository structure',
+          activeForm: 'Inspecting repository structure',
+        },
+      },
+      {
+        type: 'tool_use',
+        id: 'call_glob_1',
+        name: 'Glob',
+        input: {
+          path: '.',
+          pattern: 'src/**/*',
+        },
+      },
+    ])
+
+    const second = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [
+        { role: 'user', content: 'Analyze this project structure' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'call_task_1',
+              name: 'TaskCreate',
+              input: {
+                subject: 'Inspect repository structure',
+                activeForm: 'Inspecting repository structure',
+              },
+            },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'call_glob_1',
+              name: 'Glob',
+              input: {
+                path: '.',
+                pattern: 'src/**/*',
+              },
+            },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_task_1',
+              content: 'Task #1 created successfully: Inspect repository structure',
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: 'TaskCreate',
+          description: 'Create a task',
+          input_schema: {
+            type: 'object',
+            properties: {
+              subject: { type: 'string' },
+              activeForm: { type: 'string' },
+            },
+            required: ['subject'],
+          },
+        },
+        {
+          name: 'Glob',
+          description: 'Find files',
+          input_schema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              pattern: { type: 'string' },
+            },
+            required: ['path', 'pattern'],
+          },
+        },
+      ],
+    })
+
+    expect(second.content).toEqual([
+      {
+        type: 'text',
+        text: 'Repository inspection started.',
+        citations: null,
+      },
+    ])
+
+    expect(upstream.requests).toHaveLength(2)
+    expect(upstream.requests[1]?.body).toMatchObject({
+      previous_response_id: 'resp_multi_1',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_task_1',
+          output: 'Task #1 created successfully: Inspect repository structure',
+        },
+      ],
+    })
+  })
+
+  test('falls back to full replay when the upstream rejects previous_response_id tool continuation', async () => {
+    const upstream = startMockUpstream(async (_request, requests) => {
+      if (requests.length === 1) {
+        return Response.json({
+          id: 'resp_fallback_1',
+          status: 'completed',
+          model: 'gpt-4.1',
+          output: [
+            {
+              type: 'function_call',
+              call_id: 'call_todo_1',
+              name: 'TodoWrite',
+              arguments:
+                '{"todos":[{"content":"Analyze the repository structure","status":"in_progress","activeForm":"Analyzing the repository structure"}]}',
+            },
+          ],
+          usage: {
+            input_tokens: 9,
+            output_tokens: 3,
+          },
+        })
+      }
+
+      if (requests.length === 2) {
+        return Response.json(
+          {
+            error: {
+              message:
+                'No tool call found for function call output with call_id call_todo_1.',
+            },
+          },
+          { status: 400 },
+        )
+      }
+
+      return Response.json({
+        id: 'resp_fallback_2',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'I can now continue after the todo update.',
+              },
+            ],
+          },
+        ],
+        usage: {
+          input_tokens: 7,
+          output_tokens: 6,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+
+    const first = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Analyze this project structure' }],
+      tools: [
+        {
+          name: 'TodoWrite',
+          description: 'Update todos',
+          input_schema: {
+            type: 'object',
+            properties: {
+              todos: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    content: { type: 'string' },
+                    status: { type: 'string' },
+                    activeForm: { type: 'string' },
+                  },
+                  required: ['content', 'status'],
+                },
+              },
+            },
+            required: ['todos'],
+          },
+        },
+      ],
+    })
+
+    expect(first.content).toEqual([
+      {
+        type: 'tool_use',
+        id: 'call_todo_1',
+        name: 'TodoWrite',
+        input: {
+          todos: [
+            {
+              content: 'Analyze the repository structure',
+              status: 'in_progress',
+              activeForm: 'Analyzing the repository structure',
+            },
+          ],
+        },
+      },
+    ])
+
+    const stream = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      stream: true,
+      messages: [
+        { role: 'user', content: 'Analyze this project structure' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'call_todo_1',
+              name: 'TodoWrite',
+              input: {
+                todos: [
+                  {
+                    content: 'Analyze the repository structure',
+                    status: 'in_progress',
+                    activeForm: 'Analyzing the repository structure',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_todo_1',
+              content:
+                'Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.',
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: 'TodoWrite',
+          description: 'Update todos',
+          input_schema: {
+            type: 'object',
+            properties: {
+              todos: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    content: { type: 'string' },
+                    status: { type: 'string' },
+                    activeForm: { type: 'string' },
+                  },
+                  required: ['content', 'status'],
+                },
+              },
+            },
+            required: ['todos'],
+          },
+        },
+      ],
+    })
+
+    let text = ''
+    for await (const event of stream) {
+      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+        text += event.delta.text
+      }
+    }
+
+    expect(text).toContain('I can now continue after the todo update.')
+
+    expect(upstream.requests).toHaveLength(3)
+    expect(upstream.requests[1]?.body).toMatchObject({
+      previous_response_id: 'resp_fallback_1',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_todo_1',
+          output:
+            'Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.',
+        },
+      ],
+    })
+    expect(upstream.requests[2]?.body).not.toHaveProperty('previous_response_id')
+    expect(upstream.requests[2]?.body).toMatchObject({
+      input: [
+        {
+          role: 'user',
+          content: 'Analyze this project structure',
+        },
+        {
+          type: 'function_call',
+          call_id: 'call_todo_1',
+          name: 'TodoWrite',
+          arguments:
+            '{"todos":[{"content":"Analyze the repository structure","status":"in_progress","activeForm":"Analyzing the repository structure"}]}',
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_todo_1',
+          output:
+            'Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.',
+        },
+      ],
+    })
+  })
+
   test('emits Anthropic-compatible SSE events for streaming text', async () => {
     const logLines: string[] = []
     const upstream = startMockUpstream(async () => {
@@ -538,6 +1149,132 @@ describe('OpenAI Responses compatibility proxy', () => {
       upstream_status: 200,
       error: null,
     })
+  })
+
+  test('emits input_json_delta events for streaming tool calls', async () => {
+    const upstream = startMockUpstream(async () => {
+      return sseResponse([
+        {
+          event: 'response.output_item.added',
+          data: {
+            type: 'response.output_item.added',
+            output_index: 0,
+            item: {
+              type: 'function_call',
+              call_id: 'call_calc_stream_1',
+              name: 'calculator',
+            },
+          },
+        },
+        {
+          event: 'response.function_call_arguments.delta',
+          data: {
+            type: 'response.function_call_arguments.delta',
+            output_index: 0,
+            delta: '{"expression":"2+2"}',
+          },
+        },
+        {
+          event: 'response.function_call_arguments.done',
+          data: {
+            type: 'response.function_call_arguments.done',
+            output_index: 0,
+          },
+        },
+        {
+          event: 'response.completed',
+          data: {
+            type: 'response.completed',
+            response: {
+              id: 'resp_tool_stream_1',
+              status: 'completed',
+              model: 'gpt-4.1',
+              output: [
+                {
+                  type: 'function_call',
+                  call_id: 'call_calc_stream_1',
+                  name: 'calculator',
+                  arguments: '{"expression":"2+2"}',
+                },
+              ],
+              usage: {
+                input_tokens: 9,
+                output_tokens: 3,
+              },
+            },
+          },
+        },
+      ])
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const stream = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      stream: true,
+      messages: [{ role: 'user', content: 'What is 2 + 2?' }],
+      tools: [
+        {
+          name: 'calculator',
+          description: 'Evaluate a math expression',
+          input_schema: {
+            type: 'object',
+            properties: {
+              expression: { type: 'string' },
+            },
+            required: ['expression'],
+          },
+        },
+      ],
+    })
+
+    const events: Array<{
+      type: string
+      deltaType?: string
+      contentBlockType?: string
+      toolInput?: unknown
+    }> = []
+
+    for await (const event of stream) {
+      if (event.type === 'content_block_start') {
+        events.push({
+          type: event.type,
+          contentBlockType: event.content_block.type,
+          ...(event.content_block.type === 'tool_use'
+            ? { toolInput: event.content_block.input }
+            : {}),
+        })
+        continue
+      }
+
+      if (event.type === 'content_block_delta') {
+        events.push({ type: event.type, deltaType: event.delta.type })
+        continue
+      }
+
+      events.push({ type: event.type })
+    }
+
+    expect(events).toEqual([
+      { type: 'message_start' },
+      {
+        type: 'content_block_start',
+        contentBlockType: 'tool_use',
+        toolInput: {},
+      },
+      { type: 'content_block_delta', deltaType: 'input_json_delta' },
+      { type: 'content_block_stop' },
+      { type: 'message_delta' },
+      { type: 'message_stop' },
+    ])
   })
 
   test('returns JSON error when upstream responds 200 with an empty body', async () => {

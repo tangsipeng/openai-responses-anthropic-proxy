@@ -29,6 +29,13 @@ type ParsedSSEEvent = {
   data: unknown
 }
 
+type PendingFunctionCall = {
+  call_id: string
+  name: string
+  arguments: string
+  contentBlockIndex: number | null
+}
+
 type StreamAccumulator = {
   upstreamResponseId: string | null
   upstreamResponse: UpstreamResponse | null
@@ -38,14 +45,7 @@ type StreamAccumulator = {
   textBlockIndex: number | null
   nextContentBlockIndex: number
   emittedToolCallIds: Set<string>
-  pendingFunctionCalls: Map<
-    number,
-    {
-      call_id: string
-      name: string
-      arguments: string
-    }
-  >
+  pendingFunctionCalls: Map<number, PendingFunctionCall>
 }
 
 type UpstreamHandlingResult = {
@@ -58,6 +58,19 @@ type MessagesRequestResult = UpstreamHandlingResult & {
   model: string | null
   stream: boolean | null
 }
+
+type UpstreamRequestExecutionResult =
+  | {
+      ok: true
+      upstreamResponse: Response
+      upstreamStatus: number
+    }
+  | {
+      ok: false
+      response: Response
+      upstreamStatus: number | null
+      error: string
+    }
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -369,25 +382,18 @@ function closeTextBlock(
 function emitToolUseBlock(
   accumulator: StreamAccumulator,
   queue: SSEChunk[],
-  toolCall: { call_id: string; name: string; arguments: string },
-): void {
-  if (accumulator.emittedToolCallIds.has(toolCall.call_id)) {
-    return
-  }
-  accumulator.emittedToolCallIds.add(toolCall.call_id)
-
+  toolCall: PendingFunctionCall,
+): number {
   closeTextBlock(accumulator, queue)
   ensureMessageStarted(accumulator, queue)
 
-  let input: unknown = {}
-  try {
-    input = toolCall.arguments ? JSON.parse(toolCall.arguments) : {}
-  } catch {
-    input = {}
+  if (toolCall.contentBlockIndex !== null) {
+    return toolCall.contentBlockIndex
   }
 
   const index = accumulator.nextContentBlockIndex
   accumulator.nextContentBlockIndex += 1
+  toolCall.contentBlockIndex = index
 
   const startEvent: AnthropicRawContentBlockStartEvent = {
     type: 'content_block_start',
@@ -396,21 +402,103 @@ function emitToolUseBlock(
       type: 'tool_use',
       id: toolCall.call_id,
       name: toolCall.name,
-      input,
+      input: {},
     },
-  }
-  const stopEvent: AnthropicRawContentBlockStopEvent = {
-    type: 'content_block_stop',
-    index,
   }
 
   queue.push({
     event: 'content_block_start',
     data: startEvent,
   })
+
+  return index
+}
+
+function emitToolUseJsonDelta(
+  accumulator: StreamAccumulator,
+  queue: SSEChunk[],
+  toolCall: PendingFunctionCall,
+  partialJson: string,
+): void {
+  if (!partialJson) return
+
+  const index = emitToolUseBlock(accumulator, queue, toolCall)
+  const deltaEvent: AnthropicRawContentBlockDeltaEvent = {
+    type: 'content_block_delta',
+    index,
+    delta: {
+      type: 'input_json_delta',
+      partial_json: partialJson,
+    },
+  }
+
+  queue.push({
+    event: 'content_block_delta',
+    data: deltaEvent,
+  })
+}
+
+function mergeToolArguments(
+  streamedArguments: string,
+  fallbackArguments: unknown,
+): string {
+  if (typeof fallbackArguments !== 'string' || !fallbackArguments) {
+    return streamedArguments
+  }
+
+  if (!streamedArguments) {
+    return fallbackArguments
+  }
+
+  if (fallbackArguments.startsWith(streamedArguments)) {
+    return fallbackArguments
+  }
+
+  return streamedArguments
+}
+
+function finalizeToolUseBlock(
+  accumulator: StreamAccumulator,
+  queue: SSEChunk[],
+  toolCall: PendingFunctionCall,
+  finalArguments?: string,
+): void {
+  if (accumulator.emittedToolCallIds.has(toolCall.call_id)) {
+    return
+  }
+
+  const resolvedArguments =
+    finalArguments !== undefined ? finalArguments : toolCall.arguments
+
+  if (toolCall.contentBlockIndex === null) {
+    emitToolUseBlock(accumulator, queue, toolCall)
+    emitToolUseJsonDelta(accumulator, queue, toolCall, resolvedArguments)
+  } else if (
+    resolvedArguments &&
+    resolvedArguments.startsWith(toolCall.arguments) &&
+    resolvedArguments.length > toolCall.arguments.length
+  ) {
+    emitToolUseJsonDelta(
+      accumulator,
+      queue,
+      toolCall,
+      resolvedArguments.slice(toolCall.arguments.length),
+    )
+  }
+
+  toolCall.arguments = resolvedArguments
+
+  if (toolCall.contentBlockIndex === null) {
+    return
+  }
+
+  accumulator.emittedToolCallIds.add(toolCall.call_id)
   queue.push({
     event: 'content_block_stop',
-    data: stopEvent,
+    data: {
+      type: 'content_block_stop',
+      index: toolCall.contentBlockIndex,
+    } satisfies AnthropicRawContentBlockStopEvent,
   })
 }
 
@@ -484,11 +572,22 @@ function finalizeStreamFromResponse(
   }
 
   for (const block of toolUseBlocks) {
-    emitToolUseBlock(accumulator, queue, {
-      call_id: block.id,
-      name: block.name,
-      arguments: JSON.stringify(block.input ?? {}),
-    })
+    const pendingToolCall =
+      [...accumulator.pendingFunctionCalls.values()].find(
+        toolCall => toolCall.call_id === block.id,
+      ) ?? {
+        call_id: block.id,
+        name: block.name,
+        arguments: '',
+        contentBlockIndex: null,
+      }
+
+    finalizeToolUseBlock(
+      accumulator,
+      queue,
+      pendingToolCall,
+      JSON.stringify(block.input ?? {}),
+    )
   }
 
   closeTextBlock(accumulator, queue)
@@ -562,6 +661,7 @@ function handleParsedUpstreamEvent(
         name: payload.item.name,
         arguments:
           typeof payload.item.arguments === 'string' ? payload.item.arguments : '',
+        contentBlockIndex: null,
       })
     }
     return
@@ -579,6 +679,7 @@ function handleParsedUpstreamEvent(
       const current = accumulator.pendingFunctionCalls.get(payload.output_index)
       if (current) {
         current.arguments += payload.delta
+        emitToolUseJsonDelta(accumulator, queue, current, payload.delta)
       }
     }
     return
@@ -605,12 +706,21 @@ function handleParsedUpstreamEvent(
             call_id: payload.call_id,
             name: payload.name,
             arguments:
-              typeof payload.arguments === 'string' ? payload.arguments : '',
+              mergeToolArguments(
+                '',
+                payload.arguments,
+              ),
+            contentBlockIndex: null,
           }
         : null)
 
     if (toolCall) {
-      emitToolUseBlock(accumulator, queue, toolCall)
+      finalizeToolUseBlock(
+        accumulator,
+        queue,
+        toolCall,
+        mergeToolArguments(toolCall.arguments, payload?.arguments),
+      )
     }
     return
   }
@@ -632,12 +742,28 @@ function handleParsedUpstreamEvent(
       typeof payload.item.call_id === 'string' &&
       typeof payload.item.name === 'string'
     ) {
-      emitToolUseBlock(accumulator, queue, {
-        call_id: payload.item.call_id,
-        name: payload.item.name,
-        arguments:
-          typeof payload.item.arguments === 'string' ? payload.item.arguments : '',
-      })
+      const item = payload.item as {
+        type: 'function_call'
+        call_id: string
+        name: string
+        arguments?: unknown
+      }
+      const toolCall =
+        [...accumulator.pendingFunctionCalls.values()].find(
+          current => current.call_id === item.call_id,
+        ) ?? {
+          call_id: item.call_id,
+          name: item.name,
+          arguments: '',
+          contentBlockIndex: null,
+        }
+
+      finalizeToolUseBlock(
+        accumulator,
+        queue,
+        toolCall,
+        mergeToolArguments(toolCall.arguments, item.arguments),
+      )
     }
     return
   }
@@ -673,44 +799,116 @@ async function makeUpstreamRequest(
   })
 }
 
+function isMissingToolCallContinuationError(
+  mode: 'full' | 'incremental',
+  upstreamStatus: number,
+  message: string,
+): boolean {
+  return (
+    mode === 'incremental' &&
+    upstreamStatus === 400 &&
+    /No tool call found for function call output with call_id /.test(message)
+  )
+}
+
+async function executeUpstreamRequest(
+  config: ProxyConfig,
+  anthropicRequest: AnthropicMessagesRequest,
+  state: ProxyStateStore,
+  stream: boolean,
+): Promise<UpstreamRequestExecutionResult> {
+  const upstreamModel = config.upstreamModel ?? anthropicRequest.model
+  let upstreamRequest = translateAnthropicRequestToUpstream(
+    anthropicRequest,
+    upstreamModel,
+    state,
+  )
+  upstreamRequest.body.stream = stream
+
+  let upstreamResponse = await makeUpstreamRequest(
+    config,
+    upstreamRequest.body,
+    stream,
+  )
+
+  if (upstreamResponse.ok) {
+    return {
+      ok: true,
+      upstreamResponse,
+      upstreamStatus: upstreamResponse.status,
+    }
+  }
+
+  let errorBody = await parseJsonSafe(upstreamResponse)
+  let message =
+    upstreamPayloadErrorMessage(errorBody) ??
+    `Upstream error (${upstreamResponse.status})`
+
+  if (
+    isMissingToolCallContinuationError(
+      upstreamRequest.mode,
+      upstreamResponse.status,
+      message,
+    )
+  ) {
+    upstreamRequest = translateAnthropicRequestToUpstream(
+      anthropicRequest,
+      upstreamModel,
+      new ProxyStateStore(),
+    )
+    upstreamRequest.body.stream = stream
+
+    upstreamResponse = await makeUpstreamRequest(
+      config,
+      upstreamRequest.body,
+      stream,
+    )
+
+    if (upstreamResponse.ok) {
+      return {
+        ok: true,
+        upstreamResponse,
+        upstreamStatus: upstreamResponse.status,
+      }
+    }
+
+    errorBody = await parseJsonSafe(upstreamResponse)
+    message =
+      upstreamPayloadErrorMessage(errorBody) ??
+      `Upstream error (${upstreamResponse.status})`
+  }
+
+  return {
+    ok: false,
+    response: errorResponse(upstreamResponse.status, message),
+    upstreamStatus: upstreamResponse.status,
+    error: message,
+  }
+}
+
 async function handleNonStreamingMessagesRequest(
   config: ProxyConfig,
   state: ProxyStateStore,
   anthropicRequest: AnthropicMessagesRequest,
 ): Promise<UpstreamHandlingResult> {
-  const upstreamRequest = translateAnthropicRequestToUpstream(
-    anthropicRequest,
-    config.upstreamModel ?? anthropicRequest.model,
-    state,
-  )
-  upstreamRequest.body.stream = false
-
-  const upstreamResponse = await makeUpstreamRequest(
+  const execution = await executeUpstreamRequest(
     config,
-    upstreamRequest.body,
+    anthropicRequest,
+    state,
     false,
   )
-
-  if (!upstreamResponse.ok) {
-    const errorBody = await parseJsonSafe(upstreamResponse)
-    const message =
-      upstreamPayloadErrorMessage(errorBody) ??
-      `Upstream error (${upstreamResponse.status})`
-    return {
-      response: errorResponse(upstreamResponse.status, message),
-      upstreamStatus: upstreamResponse.status,
-      error: message,
-    }
+  if (!execution.ok) {
+    return execution
   }
 
-  const upstreamJson = await parseJsonSafe(upstreamResponse)
+  const upstreamJson = await parseJsonSafe(execution.upstreamResponse)
   if (!isValidUpstreamResponsePayload(upstreamJson)) {
     const message =
       upstreamPayloadErrorMessage(upstreamJson) ??
       'Upstream returned an invalid response payload'
     return {
       response: errorResponse(502, message),
-      upstreamStatus: upstreamResponse.status,
+      upstreamStatus: execution.upstreamStatus,
       error: message,
     }
   }
@@ -722,7 +920,7 @@ async function handleNonStreamingMessagesRequest(
   state.rememberAssistantResponse(anthropicMessage.content, upstreamJson.id)
   return {
     response: jsonResponse(anthropicMessage),
-    upstreamStatus: upstreamResponse.status,
+    upstreamStatus: execution.upstreamStatus,
     error: null,
   }
 }
@@ -732,36 +930,22 @@ async function handleStreamingMessagesRequest(
   state: ProxyStateStore,
   anthropicRequest: AnthropicMessagesRequest,
 ): Promise<UpstreamHandlingResult> {
-  const upstreamRequest = translateAnthropicRequestToUpstream(
-    anthropicRequest,
-    config.upstreamModel ?? anthropicRequest.model,
-    state,
-  )
-  upstreamRequest.body.stream = true
-
-  const upstreamResponse = await makeUpstreamRequest(
+  const execution = await executeUpstreamRequest(
     config,
-    upstreamRequest.body,
+    anthropicRequest,
+    state,
     true,
   )
-
-  if (!upstreamResponse.ok) {
-    const errorBody = await parseJsonSafe(upstreamResponse)
-    const message =
-      upstreamPayloadErrorMessage(errorBody) ??
-      `Upstream error (${upstreamResponse.status})`
-    return {
-      response: errorResponse(upstreamResponse.status, message),
-      upstreamStatus: upstreamResponse.status,
-      error: message,
-    }
+  if (!execution.ok) {
+    return execution
   }
 
+  const upstreamResponse = execution.upstreamResponse
   const contentType = upstreamResponse.headers.get('content-type') ?? ''
   if (!upstreamResponse.body) {
     return {
       response: errorResponse(502, 'Upstream response body was empty'),
-      upstreamStatus: upstreamResponse.status,
+      upstreamStatus: execution.upstreamStatus,
       error: 'Upstream response body was empty',
     }
   }
@@ -850,7 +1034,7 @@ async function handleStreamingMessagesRequest(
         connection: 'keep-alive',
       },
     }),
-    upstreamStatus: upstreamResponse.status,
+    upstreamStatus: execution.upstreamStatus,
     error: null,
   }
 }
@@ -903,10 +1087,11 @@ export function startOpenAIResponsesCompatProxy(
   config: ProxyConfig,
 ): RunningOpenAIResponsesCompatProxy {
   const host = config.listenHost ?? '127.0.0.1'
-  const state = new ProxyStateStore()
+  const state = new ProxyStateStore(config.stateFilePath)
   const server = Bun.serve({
     hostname: host,
     port: config.listenPort ?? 4141,
+    idleTimeout: 0,
     fetch: async request => {
       const url = new URL(request.url)
 

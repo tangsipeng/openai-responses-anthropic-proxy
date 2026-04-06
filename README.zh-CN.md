@@ -52,7 +52,8 @@ bun run start -- \
   --listen-port 4141 \
   --upstream-url https://api.openai.com \
   --upstream-key "$OPENAI_API_KEY" \
-  --upstream-model gpt-4.1
+  --upstream-model gpt-4.1 \
+  --state-file .openai-responses-anthropic-proxy-state.json
 ```
 
 ## 给 Claude Code 使用
@@ -65,6 +66,11 @@ export ANTHROPIC_API_KEY=dummy
 ```
 
 这里的 `dummy` 只是占位。Claude Code 需要这个变量非空，但真正访问上游的密钥由代理自己的 `.env` 或命令行参数提供。
+
+代理默认会把工具续接状态持久化到
+`.openai-responses-anthropic-proxy-state.json`，这样重启后还能继续使用
+`previous_response_id`。如果要自定义位置，可以设置
+`OPENAI_RESPONSES_STATE_FILE` 或 `--state-file`。
 
 ## 日志
 
@@ -88,6 +94,7 @@ export ANTHROPIC_API_KEY=dummy
 - `OPENAI_RESPONSES_UPSTREAM_URL`
 - `OPENAI_RESPONSES_UPSTREAM_KEY`
 - `OPENAI_RESPONSES_UPSTREAM_MODEL`
+- `OPENAI_RESPONSES_STATE_FILE`
 
 ## Docker 使用
 

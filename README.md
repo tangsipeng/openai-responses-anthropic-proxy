@@ -50,7 +50,8 @@ bun run start -- \
   --listen-port 4141 \
   --upstream-url https://api.openai.com \
   --upstream-key "$OPENAI_API_KEY" \
-  --upstream-model gpt-4.1
+  --upstream-model gpt-4.1 \
+  --state-file .openai-responses-anthropic-proxy-state.json
 ```
 
 ## Claude Code Configuration
@@ -64,6 +65,11 @@ export ANTHROPIC_API_KEY=dummy
 
 `dummy` is only a placeholder required by Claude Code. The real upstream key is
 configured on the proxy side via `.env` or CLI flags.
+
+By default the proxy persists tool continuation state to
+`.openai-responses-anthropic-proxy-state.json`, so `previous_response_id`
+survives a restart. Override it with `OPENAI_RESPONSES_STATE_FILE` or
+`--state-file`.
 
 ## Logs
 
@@ -82,6 +88,7 @@ This lets you confirm that Claude Code is actually going through the proxy.
 - `OPENAI_RESPONSES_UPSTREAM_URL`
 - `OPENAI_RESPONSES_UPSTREAM_KEY`
 - `OPENAI_RESPONSES_UPSTREAM_MODEL`
+- `OPENAI_RESPONSES_STATE_FILE`
 
 ## Docker
 

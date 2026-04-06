@@ -14,6 +14,8 @@ describe('proxy config parsing', () => {
       'sk-test',
       '--upstream-model',
       'gpt-4.1',
+      '--state-file',
+      '/tmp/proxy-state.json',
       '--upstream-header',
       'X-Test=1',
       '--upstream-header',
@@ -26,6 +28,7 @@ describe('proxy config parsing', () => {
       upstreamURL: 'https://api.openai.com',
       upstreamKey: 'sk-test',
       upstreamModel: 'gpt-4.1',
+      stateFilePath: '/tmp/proxy-state.json',
       upstreamHeaders: {
         'X-Test': '1',
         'OpenAI-Organization': 'org_123',
