@@ -87,6 +87,14 @@ export ANTHROPIC_API_KEY=dummy
 - 上游是否成功返回
 - 整体耗时大概多少
 
+## 正常使用截图
+
+下面这张图是一次真实的 Claude Code 会话，提示词为
+`分析这个项目的结构`。它通过这个代理正常返回了结构化分析结果，而不是
+工具续接错误：
+
+![Claude Code 通过代理正常工作](./docs/assets/claude-code-usage-proof.png)
+
 ## 环境变量
 
 - `OPENAI_RESPONSES_PROXY_HOST`

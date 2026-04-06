@@ -81,6 +81,14 @@ Each `POST /v1/messages` request emits one structured line to stdout:
 
 This lets you confirm that Claude Code is actually going through the proxy.
 
+## Verified Usage
+
+The screenshot below shows a real Claude Code session using this proxy to ask
+`分析这个项目的结构` and receive a normal structured answer instead of a tool
+continuation error:
+
+![Claude Code using the proxy successfully](./docs/assets/claude-code-usage-proof.png)
+
 ## Environment Variables
 
 - `OPENAI_RESPONSES_PROXY_HOST`
