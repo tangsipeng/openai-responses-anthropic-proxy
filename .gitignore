@@ -4,4 +4,6 @@ dist
 *.log
 .proxy.pid
 .DS_Store
+.openai-responses-anthropic-proxy.pid
 .openai-responses-anthropic-proxy-state.json
+.claude/

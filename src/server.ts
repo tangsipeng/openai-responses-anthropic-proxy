@@ -43,6 +43,9 @@ type StreamAccumulator = {
   anthropicMessageId: string
   messageStarted: boolean
   textBlockIndex: number | null
+  reasoningBlockIndex: number | null
+  textContentStreamed: boolean
+  thinkingContentStreamed: boolean
   nextContentBlockIndex: number
   emittedToolCallIds: Set<string>
   pendingFunctionCalls: Map<number, PendingFunctionCall>
@@ -363,6 +366,37 @@ function ensureTextBlockStarted(
   return index
 }
 
+function ensureThinkingBlockStarted(
+  accumulator: StreamAccumulator,
+  queue: SSEChunk[],
+): number {
+  if (accumulator.reasoningBlockIndex !== null) {
+    return accumulator.reasoningBlockIndex
+  }
+
+  closeTextBlock(accumulator, queue)
+  ensureMessageStarted(accumulator, queue)
+  const index = accumulator.nextContentBlockIndex
+  accumulator.nextContentBlockIndex += 1
+  accumulator.reasoningBlockIndex = index
+
+  const event: AnthropicRawContentBlockStartEvent = {
+    type: 'content_block_start',
+    index,
+    content_block: {
+      type: 'thinking',
+      thinking: '',
+    },
+  }
+
+  queue.push({
+    event: 'content_block_start',
+    data: event,
+  })
+
+  return index
+}
+
 function closeTextBlock(
   accumulator: StreamAccumulator,
   queue: SSEChunk[],
@@ -379,12 +413,74 @@ function closeTextBlock(
   accumulator.textBlockIndex = null
 }
 
+function closeThinkingBlock(
+  accumulator: StreamAccumulator,
+  queue: SSEChunk[],
+): void {
+  if (accumulator.reasoningBlockIndex === null) return
+  const event: AnthropicRawContentBlockStopEvent = {
+    type: 'content_block_stop',
+    index: accumulator.reasoningBlockIndex,
+  }
+  queue.push({
+    event: 'content_block_stop',
+    data: event,
+  })
+  accumulator.reasoningBlockIndex = null
+}
+
+function emitTextDelta(
+  accumulator: StreamAccumulator,
+  queue: SSEChunk[],
+  text: string,
+): void {
+  if (!text) return
+  closeThinkingBlock(accumulator, queue)
+  const index = ensureTextBlockStarted(accumulator, queue)
+  accumulator.textContentStreamed = true
+  const event: AnthropicRawContentBlockDeltaEvent = {
+    type: 'content_block_delta',
+    index,
+    delta: {
+      type: 'text_delta',
+      text,
+    },
+  }
+  queue.push({
+    event: 'content_block_delta',
+    data: event,
+  })
+}
+
+function emitThinkingDelta(
+  accumulator: StreamAccumulator,
+  queue: SSEChunk[],
+  thinking: string,
+): void {
+  if (!thinking) return
+  const index = ensureThinkingBlockStarted(accumulator, queue)
+  accumulator.thinkingContentStreamed = true
+  const event: AnthropicRawContentBlockDeltaEvent = {
+    type: 'content_block_delta',
+    index,
+    delta: {
+      type: 'thinking_delta',
+      thinking,
+    },
+  }
+  queue.push({
+    event: 'content_block_delta',
+    data: event,
+  })
+}
+
 function emitToolUseBlock(
   accumulator: StreamAccumulator,
   queue: SSEChunk[],
   toolCall: PendingFunctionCall,
 ): number {
   closeTextBlock(accumulator, queue)
+  closeThinkingBlock(accumulator, queue)
   ensureMessageStarted(accumulator, queue)
 
   if (toolCall.contentBlockIndex !== null) {
@@ -534,41 +630,48 @@ function finalizeStreamFromResponse(
 
   ensureMessageStarted(accumulator, queue)
 
+  const thinkingBlocks = anthropicMessage.content.filter(
+    (block): block is { type: 'thinking'; thinking?: string } =>
+      block.type === 'thinking',
+  )
   const textBlocks = anthropicMessage.content.filter(
-    block => block.type === 'text',
+    (block): block is { type: 'text'; text: string } => block.type === 'text',
   )
   const toolUseBlocks = anthropicMessage.content.filter(
-    block => block.type === 'tool_use',
+    (block): block is { type: 'tool_use'; id: string; name: string; input: unknown } =>
+      block.type === 'tool_use',
   )
 
   if (
     accumulator.textBlockIndex === null &&
+    accumulator.reasoningBlockIndex === null &&
     accumulator.emittedToolCallIds.size === 0 &&
+    thinkingBlocks.length === 0 &&
     textBlocks.length === 0 &&
     toolUseBlocks.length === 0
   ) {
     closeTextBlock(accumulator, queue)
+    closeThinkingBlock(accumulator, queue)
+  }
+
+  if (
+    accumulator.reasoningBlockIndex === null &&
+    accumulator.emittedToolCallIds.size === 0 &&
+    !accumulator.thinkingContentStreamed &&
+    thinkingBlocks.length > 0
+  ) {
+    const combined = thinkingBlocks.map(block => block.thinking ?? '').join('')
+    emitThinkingDelta(accumulator, queue, combined)
   }
 
   if (
     accumulator.textBlockIndex === null &&
     accumulator.emittedToolCallIds.size === 0 &&
+    !accumulator.textContentStreamed &&
     textBlocks.length > 0
   ) {
     const combined = textBlocks.map(block => block.text).join('')
-    const index = ensureTextBlockStarted(accumulator, queue)
-    const deltaEvent: AnthropicRawContentBlockDeltaEvent = {
-      type: 'content_block_delta',
-      index,
-      delta: {
-        type: 'text_delta',
-        text: combined,
-      },
-    }
-    queue.push({
-      event: 'content_block_delta',
-      data: deltaEvent,
-    })
+    emitTextDelta(accumulator, queue, combined)
   }
 
   for (const block of toolUseBlocks) {
@@ -591,6 +694,7 @@ function finalizeStreamFromResponse(
   }
 
   closeTextBlock(accumulator, queue)
+  closeThinkingBlock(accumulator, queue)
 
   queue.push({
     event: 'message_delta',
@@ -614,26 +718,63 @@ function handleParsedUpstreamEvent(
 ): void {
   const type = eventTypeOf(parsedEvent)
 
+  if (type === 'response.created') {
+    const payload =
+      parsedEvent.data && typeof parsedEvent.data === 'object'
+        ? (parsedEvent.data as { response?: { id?: unknown; model?: unknown } })
+        : null
+    if (typeof payload?.response?.id === 'string') {
+      accumulator.upstreamResponseId = payload.response.id
+    }
+    if (typeof payload?.response?.model === 'string') {
+      accumulator.requestedModel = payload.response.model
+    }
+    ensureMessageStarted(accumulator, queue)
+    return
+  }
+
   if (type === 'response.output_text.delta') {
     const payload =
       parsedEvent.data && typeof parsedEvent.data === 'object'
         ? (parsedEvent.data as { delta?: unknown })
         : null
     const delta = typeof payload?.delta === 'string' ? payload.delta : ''
-    if (!delta) return
-    const index = ensureTextBlockStarted(accumulator, queue)
-    const event: AnthropicRawContentBlockDeltaEvent = {
-      type: 'content_block_delta',
-      index,
-      delta: {
-        type: 'text_delta',
-        text: delta,
-      },
-    }
-    queue.push({
-      event: 'content_block_delta',
-      data: event,
-    })
+    emitTextDelta(accumulator, queue, delta)
+    return
+  }
+
+  if (type === 'response.refusal.delta') {
+    const payload =
+      parsedEvent.data && typeof parsedEvent.data === 'object'
+        ? (parsedEvent.data as { delta?: unknown })
+        : null
+    const delta = typeof payload?.delta === 'string' ? payload.delta : ''
+    emitTextDelta(accumulator, queue, delta)
+    return
+  }
+
+  if (type === 'response.output_text.done' || type === 'response.refusal.done') {
+    closeTextBlock(accumulator, queue)
+    return
+  }
+
+  if (type === 'response.reasoning.delta') {
+    const payload =
+      parsedEvent.data && typeof parsedEvent.data === 'object'
+        ? (parsedEvent.data as { delta?: unknown; text?: unknown })
+        : null
+    const delta =
+      typeof payload?.delta === 'string'
+        ? payload.delta
+        : typeof payload?.text === 'string'
+          ? payload.text
+          : ''
+    emitThinkingDelta(accumulator, queue, delta)
+    return
+  }
+
+  if (type === 'response.reasoning.done') {
+    closeThinkingBlock(accumulator, queue)
     return
   }
 
@@ -958,6 +1099,9 @@ async function handleStreamingMessagesRequest(
     anthropicMessageId: `msg_${randomUUID()}`,
     messageStarted: false,
     textBlockIndex: null,
+    reasoningBlockIndex: null,
+    textContentStreamed: false,
+    thinkingContentStreamed: false,
     nextContentBlockIndex: 0,
     emittedToolCallIds: new Set<string>(),
     pendingFunctionCalls: new Map(),

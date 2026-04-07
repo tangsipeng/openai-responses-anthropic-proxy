@@ -31,6 +31,12 @@ function isUpstreamFunctionCallItem(
   )
 }
 
+function isUpstreamReasoningItem(
+  item: UpstreamResponseOutputItem,
+): item is Extract<UpstreamResponseOutputItem, { type: 'reasoning' }> {
+  return item.type === 'reasoning'
+}
+
 function normalizeAnthropicContent(
   content: AnthropicMessageParam['content'],
 ): AnthropicContentBlock[] {
@@ -49,6 +55,51 @@ function normalizeSystemText(system: AnthropicMessagesRequest['system']): string
     .join('\n\n')
     .trim()
   return text || undefined
+}
+
+function resolveReasoningEffort(
+  request: AnthropicMessagesRequest,
+): UpstreamResponsesRequest['reasoning'] | undefined {
+  const configuredEffort =
+    request.output_config &&
+    typeof request.output_config === 'object' &&
+    !Array.isArray(request.output_config) &&
+    'effort' in request.output_config
+      ? request.output_config.effort
+      : undefined
+
+  if (configuredEffort === 'low' || configuredEffort === 'medium' || configuredEffort === 'high') {
+    return { effort: configuredEffort }
+  }
+
+  if (configuredEffort === 'max') {
+    return { effort: 'xhigh' }
+  }
+
+  const thinking = request.thinking
+  if (!thinking || typeof thinking !== 'object' || Array.isArray(thinking)) {
+    return undefined
+  }
+
+  const type = 'type' in thinking ? thinking.type : undefined
+  const budgetTokens =
+    'budget_tokens' in thinking && typeof thinking.budget_tokens === 'number'
+      ? thinking.budget_tokens
+      : undefined
+
+  if (type === 'adaptive') {
+    return { effort: 'high' }
+  }
+
+  if (type === 'enabled') {
+    if (typeof budgetTokens === 'number') {
+      if (budgetTokens < 4000) return { effort: 'low' }
+      if (budgetTokens < 16000) return { effort: 'medium' }
+    }
+    return { effort: 'high' }
+  }
+
+  return undefined
 }
 
 function imageBlockToInputImage(block: AnthropicImageBlock): UpstreamMessageContentItem {
@@ -249,12 +300,41 @@ function parseToolCall(item: UpstreamFunctionCallItem): AnthropicToolUseBlock {
   }
 }
 
+function parseReasoningText(item: Extract<UpstreamResponseOutputItem, { type: 'reasoning' }>): string | null {
+  if (!Array.isArray(item.summary)) {
+    return null
+  }
+
+  const text = item.summary
+    .map(part => {
+      if (!part || typeof part !== 'object') {
+        return ''
+      }
+      if (part.type && part.type !== 'summary_text') {
+        return ''
+      }
+      return typeof part.text === 'string' ? part.text : ''
+    })
+    .join('')
+    .trim()
+
+  return text || null
+}
+
 function mapUsage(response: UpstreamResponse): AnthropicUsage {
+  const inputTokens = response.usage?.input_tokens ?? 0
+  const outputTokens = response.usage?.output_tokens ?? 0
+  const cacheReadInputTokens =
+    response.usage?.cache_read_input_tokens ??
+    response.usage?.input_tokens_details?.cached_tokens ??
+    response.usage?.prompt_tokens_details?.cached_tokens ??
+    null
+
   return {
-    input_tokens: response.usage?.input_tokens ?? 0,
-    output_tokens: response.usage?.output_tokens ?? 0,
-    cache_creation_input_tokens: null,
-    cache_read_input_tokens: response.usage?.input_tokens_details?.cached_tokens ?? null,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_creation_input_tokens: response.usage?.cache_creation_input_tokens ?? null,
+    cache_read_input_tokens: cacheReadInputTokens,
   }
 }
 
@@ -268,7 +348,9 @@ function inferStopReason(
 
   if (
     response.status === 'incomplete' &&
-    response.incomplete_details?.reason === 'max_output_tokens'
+    (response.incomplete_details?.reason === 'max_output_tokens' ||
+      response.incomplete_details?.reason === 'max_tokens' ||
+      response.incomplete_details?.reason === undefined)
   ) {
     return 'max_tokens'
   }
@@ -289,6 +371,17 @@ export function translateUpstreamResponseToAnthropicMessage(
       continue
     }
 
+    if (isUpstreamReasoningItem(item)) {
+      const thinking = parseReasoningText(item)
+      if (thinking) {
+        content.push({
+          type: 'thinking',
+          thinking,
+        })
+      }
+      continue
+    }
+
     if (item.type !== 'message') {
       continue
     }
@@ -298,11 +391,15 @@ export function translateUpstreamResponseToAnthropicMessage(
     }
 
     const text = item.content
-      .filter(
-        (part): part is { type: 'output_text'; text: string } =>
-          part?.type === 'output_text' && typeof part.text === 'string',
-      )
-      .map(part => part.text)
+      .map(part => {
+        if (part?.type === 'output_text' && typeof part.text === 'string') {
+          return part.text
+        }
+        if (part?.type === 'refusal' && typeof part.refusal === 'string') {
+          return part.refusal
+        }
+        return ''
+      })
       .join('')
 
     if (!text) continue
@@ -357,6 +454,7 @@ export function translateAnthropicRequestToUpstream(
   const instructions = normalizeSystemText(request.system)
   const tools = convertTools(request.tools)
   const toolChoice = convertToolChoice(request.tool_choice)
+  const reasoning = resolveReasoningEffort(request)
 
   const messagesToTranslate =
     previous && previous.assistantIndex >= 0
@@ -376,6 +474,7 @@ export function translateAnthropicRequestToUpstream(
       ...(toolChoice.parallel_tool_calls !== undefined
         ? { parallel_tool_calls: toolChoice.parallel_tool_calls }
         : {}),
+      ...(reasoning ? { reasoning } : {}),
       max_output_tokens: request.max_tokens,
       ...(previous ? { previous_response_id: previous.responseId } : {}),
       stream: Boolean(request.stream),

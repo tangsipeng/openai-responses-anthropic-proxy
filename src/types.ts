@@ -102,7 +102,7 @@ export type AnthropicMessageResponse = {
   id: string
   type: 'message'
   role: 'assistant'
-  content: Array<AnthropicTextBlock | AnthropicToolUseBlock>
+  content: Array<AnthropicTextBlock | AnthropicToolUseBlock | AnthropicThinkingBlock>
   model: string
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null
   stop_sequence: string | null
@@ -117,7 +117,7 @@ export type AnthropicRawMessageStartEvent = {
 export type AnthropicRawContentBlockStartEvent = {
   type: 'content_block_start'
   index: number
-  content_block: AnthropicTextBlock | AnthropicToolUseBlock
+  content_block: AnthropicTextBlock | AnthropicToolUseBlock | AnthropicThinkingBlock
 }
 
 export type AnthropicRawContentBlockDeltaEvent = {
@@ -127,6 +127,10 @@ export type AnthropicRawContentBlockDeltaEvent = {
     | {
         type: 'text_delta'
         text: string
+      }
+    | {
+        type: 'thinking_delta'
+        thinking: string
       }
     | {
         type: 'input_json_delta'
@@ -213,7 +217,7 @@ export type UpstreamResponseOutputItem =
   | UpstreamFunctionCallItem
   | {
       type: 'reasoning'
-      summary?: Array<{ text?: string }>
+      summary?: Array<{ type?: string; text?: string }>
       [key: string]: unknown
     }
   | {
@@ -228,6 +232,11 @@ export type UpstreamUsage = {
   input_tokens_details?: {
     cached_tokens?: number
   }
+  prompt_tokens_details?: {
+    cached_tokens?: number
+  }
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
 }
 
 export type UpstreamResponse = {
@@ -249,6 +258,9 @@ export type UpstreamResponsesRequest = {
   tools?: UpstreamFunctionTool[]
   tool_choice?: string | Record<string, unknown>
   parallel_tool_calls?: boolean
+  reasoning?: {
+    effort?: 'low' | 'medium' | 'high' | 'xhigh'
+  }
   max_output_tokens?: number
   previous_response_id?: string
   stream?: boolean

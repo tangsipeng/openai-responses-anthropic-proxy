@@ -56,6 +56,28 @@ bun run start -- \
   --state-file .openai-responses-anthropic-proxy-state.json
 ```
 
+## 辅助脚本
+
+项目内置了几个轻量脚本，方便把代理当作后台服务管理：
+
+```bash
+./start-proxy.sh
+./proxy-status.sh
+./stop-proxy.sh
+```
+
+它们的作用分别是：
+
+- `start-proxy.sh`：后台启动代理，把 PID 写入
+  `.openai-responses-anthropic-proxy.pid`，并把日志追加到
+  `.openai-responses-anthropic-proxy.log`
+- `proxy-status.sh`：输出当前状态，可能是 `running`、`stale-pid` 或
+  `stopped`
+- `stop-proxy.sh`：读取 PID 文件并停止正在运行的代理进程
+
+如果需要自定义 PID 文件路径，可以设置
+`OPENAI_RESPONSES_PROXY_PID_FILE`。
+
 ## 给 Claude Code 使用
 
 启动代理后，把 Claude Code 指到本地代理：
@@ -63,9 +85,10 @@ bun run start -- \
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:4141
 export ANTHROPIC_API_KEY=dummy
+export ANTHROPIC_MODEL=my-proxy-codex
 ```
 
-这里的 `dummy` 只是占位。Claude Code 需要这个变量非空，但真正访问上游的密钥由代理自己的 `.env` 或命令行参数提供。
+这里的 `dummy` 只是占位。Claude Code 需要这个变量非空，但真正访问上游的密钥由代理自己的 `.env` 或命令行参数提供。`ANTHROPIC_MODEL` 是 Claude Code 本地显示的模型名；代理实际转发到的真实上游模型仍然由 `OPENAI_RESPONSES_UPSTREAM_MODEL` 或 `--upstream-model` 决定。
 
 代理默认会把工具续接状态持久化到
 `.openai-responses-anthropic-proxy-state.json`，这样重启后还能继续使用
@@ -95,10 +118,25 @@ export ANTHROPIC_API_KEY=dummy
 
 ![Claude Code 通过代理正常工作](./docs/assets/claude-code-usage-proof.png)
 
+## 版本记录
+
+- 2026-04-08
+  - 增强了 Responses → Anthropic 的协议转换，补上 reasoning summary、refusal 文本、cache token usage 字段和 incomplete/max-token stop reason
+  - 扩展了 streaming SSE 处理，支持 reasoning 和 refusal 增量事件
+  - 补充了 reasoning、refusal、usage 归一化、reasoning effort 映射和 streaming 行为的回归测试
+  - 新增 `start-proxy.sh`、`stop-proxy.sh` 和 `proxy-status.sh`，方便本地管理代理进程
+- 2026-04-07
+  - README 增加真实使用截图
+  - 修复 Responses 上游的工具续接兼容性
+- 2026-04-06
+  - 初始版本发布
+  - 增加带本地时区偏移的请求日志
+
 ## 环境变量
 
 - `OPENAI_RESPONSES_PROXY_HOST`
 - `OPENAI_RESPONSES_PROXY_PORT`
+- `OPENAI_RESPONSES_PROXY_PID_FILE`
 - `OPENAI_RESPONSES_UPSTREAM_URL`
 - `OPENAI_RESPONSES_UPSTREAM_KEY`
 - `OPENAI_RESPONSES_UPSTREAM_MODEL`
@@ -153,4 +191,7 @@ src/translate.ts
 src/state.ts
 src/config.ts
 src/types.ts
+start-proxy.sh
+stop-proxy.sh
+proxy-status.sh
 ```

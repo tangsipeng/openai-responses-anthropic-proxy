@@ -317,6 +317,290 @@ describe('OpenAI Responses compatibility proxy', () => {
     })
   })
 
+  test('maps reasoning summaries and refusals into Anthropic-compatible content blocks', async () => {
+    const upstream = startMockUpstream(async () => {
+      return Response.json({
+        id: 'resp_reasoning_refusal_1',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'I should decline this request.' }],
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'refusal', refusal: 'I can’t help with that.' }],
+          },
+        ],
+        usage: {
+          input_tokens: 12,
+          output_tokens: 5,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const response = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Do something disallowed' }],
+    })
+
+    expect(response.stop_reason).toBe('end_turn')
+    expect(response.content as any).toEqual([
+      {
+        type: 'thinking',
+        thinking: 'I should decline this request.',
+      },
+      {
+        type: 'text',
+        text: 'I can’t help with that.',
+        citations: null,
+      },
+    ])
+  })
+
+  test('maps usage cache token fields from nested usage details', async () => {
+    const upstream = startMockUpstream(async () => {
+      return Response.json({
+        id: 'resp_usage_nested_1',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'cached response' }],
+          },
+        ],
+        usage: {
+          input_tokens: 17,
+          output_tokens: 6,
+          input_tokens_details: {
+            cached_tokens: 9,
+          },
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const response = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Say cached response' }],
+    })
+
+    expect(response.usage).toEqual({
+      input_tokens: 17,
+      output_tokens: 6,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: 9,
+    })
+  })
+
+  test('prefers direct cache usage fields over prompt-token fallbacks', async () => {
+    const upstream = startMockUpstream(async () => {
+      return Response.json({
+        id: 'resp_usage_direct_1',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'direct cache response' }],
+          },
+        ],
+        usage: {
+          input_tokens: 19,
+          output_tokens: 4,
+          prompt_tokens_details: {
+            cached_tokens: 5,
+          },
+          cache_read_input_tokens: 11,
+          cache_creation_input_tokens: 3,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const response = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Say direct cache response' }],
+    })
+
+    expect(response.usage).toEqual({
+      input_tokens: 19,
+      output_tokens: 4,
+      cache_creation_input_tokens: 3,
+      cache_read_input_tokens: 11,
+    })
+  })
+
+  test('maps Anthropic reasoning controls to upstream reasoning effort', async () => {
+    const upstream = startMockUpstream(async () => {
+      return Response.json({
+        id: 'resp_reasoning_request_1',
+        status: 'completed',
+        model: 'gpt-4.1',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: {
+          input_tokens: 2,
+          output_tokens: 1,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const firstResponse = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': 'test-key',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-test',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'Reply with ok' }],
+        output_config: { effort: 'max' },
+      }),
+    })
+    expect(firstResponse.status).toBe(200)
+    await firstResponse.json()
+
+    const secondResponse = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': 'test-key',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-test',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'Reply with ok again' }],
+        thinking: { type: 'enabled', budget_tokens: 8000 },
+      }),
+    })
+    expect(secondResponse.status).toBe(200)
+    await secondResponse.json()
+
+    expect(upstream.requests[0]?.body).toMatchObject({
+      reasoning: { effort: 'xhigh' },
+    })
+    expect(upstream.requests[1]?.body).toMatchObject({
+      reasoning: { effort: 'medium' },
+    })
+  })
+
+  test('maps incomplete max-token responses to Anthropic max_tokens stop reason', async () => {
+    const upstream = startMockUpstream(async (_request, requests) => {
+      if (requests.length === 1) {
+        return Response.json({
+          id: 'resp_incomplete_1',
+          status: 'incomplete',
+          model: 'gpt-4.1',
+          incomplete_details: {
+            reason: 'max_tokens',
+          },
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'partial one' }],
+            },
+          ],
+          usage: {
+            input_tokens: 3,
+            output_tokens: 2,
+          },
+        })
+      }
+
+      return Response.json({
+        id: 'resp_incomplete_2',
+        status: 'incomplete',
+        model: 'gpt-4.1',
+        incomplete_details: {
+          reason: 'max_output_tokens',
+        },
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'partial two' }],
+          },
+        ],
+        usage: {
+          input_tokens: 4,
+          output_tokens: 2,
+        },
+      })
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const first = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Give me a long answer' }],
+    })
+    const second = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Give me another long answer' }],
+    })
+
+    expect(first.stop_reason).toBe('max_tokens')
+    expect(second.stop_reason).toBe('max_tokens')
+  })
+
   test('uses previous_response_id and function_call_output on the next turn when state is available', async () => {
     const upstream = startMockUpstream(async (_request, requests) => {
       if (requests.length === 1) {
@@ -1149,6 +1433,185 @@ describe('OpenAI Responses compatibility proxy', () => {
       upstream_status: 200,
       error: null,
     })
+  })
+
+  test('emits thinking deltas for streaming reasoning events without duplicating finalized content', async () => {
+    const upstream = startMockUpstream(async () => {
+      return sseResponse([
+        {
+          event: 'response.reasoning.delta',
+          data: {
+            type: 'response.reasoning.delta',
+            delta: 'Thinking step',
+          },
+        },
+        {
+          event: 'response.reasoning.done',
+          data: {
+            type: 'response.reasoning.done',
+          },
+        },
+        {
+          event: 'response.completed',
+          data: {
+            type: 'response.completed',
+            response: {
+              id: 'resp_reasoning_stream_1',
+              status: 'completed',
+              model: 'gpt-4.1',
+              output: [
+                {
+                  type: 'reasoning',
+                  summary: [{ type: 'summary_text', text: 'Thinking step' }],
+                },
+              ],
+              usage: {
+                input_tokens: 5,
+                output_tokens: 2,
+              },
+            },
+          },
+        },
+      ])
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const stream = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      stream: true,
+      messages: [{ role: 'user', content: 'Think first' }],
+    })
+
+    const events: Array<{
+      type: string
+      deltaType?: string
+      contentBlockType?: string
+    }> = []
+
+    for await (const event of stream) {
+      if (event.type === 'content_block_start') {
+        events.push({
+          type: event.type,
+          contentBlockType: event.content_block.type,
+        })
+        continue
+      }
+
+      if (event.type === 'content_block_delta') {
+        events.push({ type: event.type, deltaType: event.delta.type })
+        continue
+      }
+
+      events.push({ type: event.type })
+    }
+
+    expect(events).toEqual([
+      { type: 'message_start' },
+      { type: 'content_block_start', contentBlockType: 'thinking' },
+      { type: 'content_block_delta', deltaType: 'thinking_delta' },
+      { type: 'content_block_stop' },
+      { type: 'message_delta' },
+      { type: 'message_stop' },
+    ])
+  })
+
+  test('emits text deltas for streaming refusal events without duplicating finalized content', async () => {
+    const upstream = startMockUpstream(async () => {
+      return sseResponse([
+        {
+          event: 'response.refusal.delta',
+          data: {
+            type: 'response.refusal.delta',
+            delta: 'I can’t help with that.',
+          },
+        },
+        {
+          event: 'response.refusal.done',
+          data: {
+            type: 'response.refusal.done',
+          },
+        },
+        {
+          event: 'response.completed',
+          data: {
+            type: 'response.completed',
+            response: {
+              id: 'resp_refusal_stream_1',
+              status: 'completed',
+              model: 'gpt-4.1',
+              output: [
+                {
+                  type: 'message',
+                  role: 'assistant',
+                  content: [{ type: 'refusal', refusal: 'I can’t help with that.' }],
+                },
+              ],
+              usage: {
+                input_tokens: 5,
+                output_tokens: 2,
+              },
+            },
+          },
+        },
+      ])
+    })
+    mockServers.push(upstream)
+
+    proxy = startOpenAIResponsesCompatProxy({
+      listenPort: 0,
+      upstreamURL: `http://127.0.0.1:${upstream.port}`,
+      upstreamKey: 'upstream-key',
+      upstreamModel: 'gpt-4.1',
+    })
+
+    const anthropic = createAnthropicClient(`http://127.0.0.1:${proxy.port}`)
+    const stream = await anthropic.beta.messages.create({
+      model: 'claude-sonnet-test',
+      max_tokens: 128,
+      stream: true,
+      messages: [{ role: 'user', content: 'Do something disallowed' }],
+    })
+
+    const events: Array<{
+      type: string
+      deltaType?: string
+      contentBlockType?: string
+    }> = []
+
+    for await (const event of stream) {
+      if (event.type === 'content_block_start') {
+        events.push({
+          type: event.type,
+          contentBlockType: event.content_block.type,
+        })
+        continue
+      }
+
+      if (event.type === 'content_block_delta') {
+        events.push({ type: event.type, deltaType: event.delta.type })
+        continue
+      }
+
+      events.push({ type: event.type })
+    }
+
+    expect(events).toEqual([
+      { type: 'message_start' },
+      { type: 'content_block_start', contentBlockType: 'text' },
+      { type: 'content_block_delta', deltaType: 'text_delta' },
+      { type: 'content_block_stop' },
+      { type: 'message_delta' },
+      { type: 'message_stop' },
+    ])
   })
 
   test('emits input_json_delta events for streaming tool calls', async () => {
